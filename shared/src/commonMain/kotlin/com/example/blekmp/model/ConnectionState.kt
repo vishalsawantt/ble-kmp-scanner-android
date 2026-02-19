@@ -1,13 +1,5 @@
 package com.example.blekmp.model
 
-/**
- * Sealed class representing all possible BLE connection states.
- * Shared across Android and iOS via commonMain.
- *
- * Flow of states:
- * Disconnected → Scanning → Connecting → Connected → Disconnected
- *                                                  ↘ Reconnecting → Connected
- */
 sealed class ConnectionState {
 
     /** No device connected, not scanning */

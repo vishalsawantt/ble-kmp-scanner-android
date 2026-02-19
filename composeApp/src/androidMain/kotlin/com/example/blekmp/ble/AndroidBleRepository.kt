@@ -39,6 +39,8 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
         private const val RECONNECT_DELAY_MS = 2000L
     }
 
+    private val systemConnectedDevices = mutableSetOf<String>() // Track system-connected devices
+
     private val bluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
@@ -67,80 +69,82 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 BluetoothDevice.ACTION_ACL_CONNECTED -> {
-                    val device: BluetoothDevice? =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(
-                                BluetoothDevice.EXTRA_DEVICE,
-                                BluetoothDevice::class.java
-                            )
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                        }
+                    val device: BluetoothDevice? = getDeviceFromIntent(intent)
                     device?.let {
-                        if (it.address == lastConnectedDevice?.address) {
-                            Log.d(TAG, "Device connected via ACL: ${it.name}")
-                            isConnected = true
-                            val updatedDevice = lastConnectedDevice?.copy(isConnected = true)
-                            updatedDevice?.let { dev ->
-                                _connectionState.value = ConnectionState.Connected(dev)
-                                // Try to get battery level
-                                readBatteryLevelFromAudioDevice(it)
-                            }
-                        }
+                        Log.d(TAG, "System connected to device: ${it.name} (${it.address})")
+                        systemConnectedDevices.add(it.address)
+
+                        // Update any matching device in scanned list
+                        updateDeviceSystemConnection(it.address, true)
                     }
                 }
 
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
-                    val device: BluetoothDevice? =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(
-                                BluetoothDevice.EXTRA_DEVICE,
-                                BluetoothDevice::class.java
-                            )
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                        }
+                    val device: BluetoothDevice? = getDeviceFromIntent(intent)
                     device?.let {
-                        if (it.address == lastConnectedDevice?.address && !isManualDisconnect) {
-                            Log.d(TAG, "Device disconnected via ACL: ${it.name}")
-                            isConnected = false
-                            handleDisconnection()
-                        }
+                        Log.d(TAG, "System disconnected from device: ${it.name} (${it.address})")
+                        systemConnectedDevices.remove(it.address)
+
+                        // Update any matching device in scanned list
+                        updateDeviceSystemConnection(it.address, false)
                     }
                 }
 
                 BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
-                    val device: BluetoothDevice? =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(
-                                BluetoothDevice.EXTRA_DEVICE,
-                                BluetoothDevice::class.java
-                            )
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                        }
+                    val device: BluetoothDevice? = getDeviceFromIntent(intent)
                     val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)
                     device?.let {
-                        if (it.address == lastConnectedDevice?.address) {
-                            when (bondState) {
-                                BluetoothDevice.BOND_BONDED -> {
-                                    Log.d(TAG, "Device bonded: ${it.name}")
-                                }
-
-                                BluetoothDevice.BOND_NONE -> {
-                                    Log.d(TAG, "Device unbonded: ${it.name}")
-                                    if (!isManualDisconnect) {
-                                        _connectionState.value = ConnectionState.Disconnected
-                                    }
-                                }
+                        when (bondState) {
+                            BluetoothDevice.BOND_BONDED -> {
+                                Log.d(TAG, "Device bonded: ${it.name}")
+                                updateDevicePairedStatus(it.address, true)
+                            }
+                            BluetoothDevice.BOND_NONE -> {
+                                Log.d(TAG, "Device unbonded: ${it.name}")
+                                updateDevicePairedStatus(it.address, false)
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Helper to get device from intent (compatible with all Android versions)
+    private fun getDeviceFromIntent(intent: Intent): BluetoothDevice? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+        }
+    }
+
+    // Update a device's system connection status in the scanned list
+    // Update a device's system connection status in the scanned list
+    private fun updateDeviceSystemConnection(address: String, connected: Boolean) {
+        val currentList = _scannedDevices.value.toMutableList()
+        val index = currentList.indexOfFirst { it.address == address }
+        if (index >= 0) {
+            val oldDevice = currentList[index]
+            // FIXED: Don't use lastConnectedDevice here, use oldDevice
+            val updatedDevice = oldDevice.copy(isSystemConnected = connected)  // Changed this line
+            currentList[index] = updatedDevice
+            _scannedDevices.value = currentList
+            Log.d(TAG, "Updated system connection for $address: $connected")
+        }
+    }
+
+    // Update a device's paired status in the scanned list
+    private fun updateDevicePairedStatus(address: String, paired: Boolean) {
+        val currentList = _scannedDevices.value.toMutableList()
+        val index = currentList.indexOfFirst { it.address == address }
+        if (index >= 0) {
+            val oldDevice = currentList[index]
+            val updatedDevice = oldDevice.copy(isPaired = paired)
+            currentList[index] = updatedDevice
+            _scannedDevices.value = currentList
+            Log.d(TAG, "Updated paired status for $address: $paired")
         }
     }
 
@@ -189,11 +193,10 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
             }
 
             val isPaired = isDevicePaired(device.address)
+            val isSystemConnected = systemConnectedDevices.contains(device.address)
+            val isAppConnected = isConnected && device.address == lastConnectedDevice?.address
 
-            Log.d(
-                TAG,
-                "Found device: name=${device.name}, address=${device.address}, type=$deviceType, rssi=$rssi, paired=$isPaired"
-            )
+            Log.d(TAG, "Device ${device.name} - System connected: $isSystemConnected, App connected: $isAppConnected")
 
             val bleDevice = BleDevice(
                 name = device.name,
@@ -202,18 +205,25 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
                 type = deviceType,
                 isAudioDevice = deviceType.contains("Dual") || deviceType.contains("Classic"),
                 isPaired = isPaired,
-                isConnected = isConnected && device.address == lastConnectedDevice?.address
+                isConnectedInApp = isConnected && device.address == lastConnectedDevice?.address,  // <-- FIXED
+                isSystemConnected = systemConnectedDevices.contains(device.address),  // <-- ADD THIS
+                hasBatteryService = false,
+                hasHeartRateService = false
             )
 
             val currentList = _scannedDevices.value.toMutableList()
             val existingIndex = currentList.indexOfFirst { it.address == bleDevice.address }
             if (existingIndex >= 0) {
-                currentList[existingIndex] = bleDevice
+                // Preserve battery level and service info if they exist
+                val existing = currentList[existingIndex]
+                val mergedDevice = bleDevice.copy(
+                    batteryLevel = existing.batteryLevel,
+                    hasBatteryService = existing.hasBatteryService,
+                    hasHeartRateService = existing.hasHeartRateService
+                )
+                currentList[existingIndex] = mergedDevice
             } else {
                 currentList.add(bleDevice)
-                if (bleDevice.isAudioDevice) {
-                    Log.d(TAG, "Audio device detected: ${device.name}. Paired: $isPaired")
-                }
             }
             _scannedDevices.value = currentList
         }
@@ -278,8 +288,8 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
                     name = deviceName,
                     hasBatteryService = hasBatteryService,
                     hasHeartRateService = hasHeartRateService,
-                    isConnected = true,
-                    batteryLevel = null // Reset battery level
+                    isConnectedInApp = true,  // <-- FIXED
+                    batteryLevel = null
                 )
 
                 _connectionState.value = ConnectionState.Connected(updatedDevice)
@@ -391,6 +401,12 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
         }
 
         stopScan()
+
+        // If there was a previous app-connected device, mark it as disconnected
+        if (lastConnectedDevice != null) {
+            updateAppConnection(lastConnectedDevice!!.address, false)
+        }
+
         lastConnectedDevice = device
         reconnectAttempts = 0
         isManualDisconnect = false
@@ -399,38 +415,49 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
         if (device.isAudioDevice) {
             Log.d(TAG, "Audio device detected: ${device.displayName}")
 
-            // Check if device is paired
             if (!device.isPaired) {
                 Log.d(TAG, "Device is not paired. Please pair first")
                 _connectionState.value = ConnectionState.Error("Please pair the device first in system Bluetooth settings")
-
                 val intent = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 context.startActivity(intent)
                 return
             }
 
-            // For audio devices, we don't actually "connect" via our app
-            // The system handles the audio connection
             _connectionState.value = ConnectionState.Connecting(device)
 
-            // Show as connected after a short delay (since it's paired)
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                // Mark as app-connected
+                updateAppConnection(device.address, true)
+
+                // FIXED: Create updated device correctly
                 val updatedDevice = device.copy(
-                    isConnected = true,
-                    hasBatteryService = false // Assume no battery service initially
+                    isConnectedInApp = true,  // Changed from isConnected
+                    hasBatteryService = false
                 )
+
                 _connectionState.value = ConnectionState.Connected(updatedDevice)
                 isConnected = true
 
-                // Try to read battery (might work for some modern headphones)
                 readBatteryLevelFromAudioDevice(bluetoothAdapter?.getRemoteDevice(device.address)!!)
             }, 1500)
 
         } else {
-            // For BLE devices, use GATT
             connectionType = "BLE"
             connectGatt(device)
+        }
+    }
+
+    // Helper to update app connection status in scanned list
+    private fun updateAppConnection(address: String, connected: Boolean) {
+        val currentList = _scannedDevices.value.toMutableList()
+        val index = currentList.indexOfFirst { it.address == address }
+        if (index >= 0) {
+            val oldDevice = currentList[index]
+            val updatedDevice = oldDevice.copy(isConnectedInApp = connected)
+            currentList[index] = updatedDevice
+            _scannedDevices.value = currentList
+            Log.d(TAG, "Updated app connection for $address: $connected")
         }
     }
 
@@ -618,26 +645,27 @@ class AndroidBleRepository(private val context: Context) : BleRepository {
     override fun disconnect() {
         Log.d(TAG, "disconnect called")
         isManualDisconnect = true
+
+        // Mark current app-connected device as disconnected
+        lastConnectedDevice?.let { device ->
+            updateAppConnection(device.address, false)
+        }
+
         isConnected = false
 
         try {
-            // For audio devices, we can't force disconnect through app
-            // Just update the UI state
             if (lastConnectedDevice?.isAudioDevice == true) {
                 Log.d(TAG, "Audio device disconnect - updating UI only")
-                // The system will maintain the connection for audio
                 _connectionState.value = ConnectionState.Disconnected
                 lastConnectedDevice = null
                 reconnectAttempts = 0
                 return
             }
 
-            // Disconnect GATT
             bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
             bluetoothGatt = null
 
-            // Disconnect classic socket
             bluetoothSocket?.close()
             bluetoothSocket = null
 
